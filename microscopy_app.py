@@ -7,6 +7,8 @@ import numpy as np
 import requests
 import tifffile
 import hashlib
+import traceback
+import time
 from io import BytesIO
 import base64
 import json
@@ -96,9 +98,18 @@ def _decode_tif_from_b64(content_string):
     """
     key = hashlib.md5(content_string.encode('ascii')).hexdigest()
     if key not in _tif_decode_cache:
+        print(f"[update_image] decoding TIF upload: {len(content_string) / 1e6:.1f} MB of "
+              "base64 text received from the browser", flush=True)
+        t0 = time.time()
         decoded = base64.b64decode(content_string)
+        print(f"[update_image] base64-decoded to {len(decoded) / 1e6:.1f} MB of raw bytes "
+              f"({time.time() - t0:.2f}s)", flush=True)
+        t0 = time.time()
+        array = _load_tif_array(BytesIO(decoded))
+        print(f"[update_image] tifffile parsed array shape={array.shape} dtype={array.dtype} "
+              f"({time.time() - t0:.2f}s)", flush=True)
         _tif_decode_cache.clear()
-        _tif_decode_cache[key] = _load_tif_array(BytesIO(decoded))
+        _tif_decode_cache[key] = array
     return _tif_decode_cache[key]
 
 
@@ -505,6 +516,9 @@ def update_image(upload_contents, rotation, channel, upload_filename):
 
     ctx = dash.callback_context
     trigger_id = ctx.triggered[0]['prop_id'] if ctx.triggered else '.'
+    print(f"[update_image] triggered by {trigger_id!r} filename={upload_filename!r} "
+          f"rotation={rotation} channel={channel} "
+          f"contents_received={upload_contents is not None}", flush=True)
 
     if trigger_id == 'upload-image.contents':
         if upload_contents is not None:
@@ -518,9 +532,12 @@ def update_image(upload_contents, rotation, channel, upload_filename):
                     decoded = base64.b64decode(content_string)
                     _uploaded_image = ImageOps.exif_transpose(Image.open(BytesIO(decoded))).convert('RGB')
                     _uploaded_tif_array = None
+                print(f"[update_image] upload decoded OK (is_tif={is_tif})", flush=True)
             except Exception:
-                pass
+                print(f"[update_image] FAILED to decode upload {upload_filename!r}:", flush=True)
+                traceback.print_exc()
         else:
+            print("[update_image] upload cleared", flush=True)
             _uploaded_image = None
             _uploaded_tif_array = None
 
@@ -536,10 +553,14 @@ def update_image(upload_contents, rotation, channel, upload_filename):
         plane = _normalize_to_uint8(_uploaded_tif_array[:, :, ch])
         _uploaded_image = Image.fromarray(plane, mode='L')
         source = 'tif'
+        print(f"[update_image] displaying TIF channel {ch}/{n_channels - 1}, "
+              f"array shape={_uploaded_tif_array.shape}", flush=True)
 
     # Always generate rotated data
     current = _uploaded_image if _uploaded_image is not None else original_image
     data = _get_rotated_data(current, rotation)
+    print(f"[update_image] returning image-store data: source={source} w={data['w']} "
+          f"h={data['h']}", flush=True)
     return {'b64': data['b64'], 'w': data['w'], 'h': data['h'], 'pw': data['pw'], 'ph': data['ph'],
             'source': source, 'n_channels': n_channels}
 
