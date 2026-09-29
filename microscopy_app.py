@@ -5,6 +5,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 Image.MAX_IMAGE_PIXELS = None
 import numpy as np
 import requests
+import tifffile
+import hashlib
 from io import BytesIO
 import base64
 import json
@@ -17,12 +19,22 @@ app = dash.Dash(__name__, title="Microscopy Grid Aligner")
 #   and never restricted anything (pre-"Section Crop"). Files saved by that older version of
 #   this app have no `schema_version` key at all.
 # 2: "Section Crop" is functional — crop_top/bottom/left/right are real bounds that restrict
-#   the grid/wells/exports. Every save from this version of the app writes `schema_version: 2`.
+#   the grid/wells/exports.
+# 3: the grid was aligned against an uploaded TIF (viewing one channel at a time) instead of the
+#   merge JPG, because the JPG export isn't always pixel-perfect against the tile-stitched TIF.
+#   These files record an explicit `source` field ("tif" or "jpg") alongside
+#   `schema_version: 3`. Every save from this version of the app writes `schema_version: 3` and
+#   `source`. Files with schema_version < 3 (or no key at all) always imply `source == "jpg"`,
+#   since TIF-source alignment didn't exist yet when they were written.
 #
-# `load_settings` uses this to stay backwards compatible: legacy files (schema_version < 2)
-# have their stored crop values ignored on load (reset to 0), so old alignments open exactly
-# as they looked when they were saved, instead of suddenly being clipped by cosmetic leftovers.
-SETTINGS_SCHEMA_VERSION = 2
+# `CROP_SCHEMA_VERSION` (kept separate from `SETTINGS_SCHEMA_VERSION`, which just tracks the
+# CURRENT format this app writes) is the fixed threshold `load_settings` uses to stay backwards
+# compatible: legacy files (schema_version < CROP_SCHEMA_VERSION) have their stored crop values
+# ignored on load (reset to 0), so old alignments open exactly as they looked when they were
+# saved, instead of suddenly being clipped by cosmetic leftovers. Bumping
+# `SETTINGS_SCHEMA_VERSION` for the new `source` field must NOT change that threshold.
+CROP_SCHEMA_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 3
 
 # ── Load sample image ──────────────────────────────────────────────────
 try:
@@ -39,6 +51,69 @@ except Exception:
 # ── Rotation cache ─────────────────────────────────────────────────────
 _rotation_cache = {}
 _uploaded_image = None
+
+# ── TIF upload state ───────────────────────────────────────────────────
+# When the active upload is a TIF, `_uploaded_image` is (re)built from a SINGLE selected
+# channel (as a grayscale 'L' PIL image) of `_uploaded_tif_array`, so every other callback in
+# this app -- which all just read the `_uploaded_image` global -- keeps working unchanged.
+# `_uploaded_tif_array` (Y, X, C) holds the FULL set of channels so switching the "Channel"
+# control doesn't require re-uploading.
+_uploaded_tif_array = None
+_tif_decode_cache = {}
+
+
+def _load_tif_array(file_obj):
+    """Load a (possibly multi-channel, possibly OME-) TIFF into a (Y, X, C) array, collapsing
+    any extra axes (Z, T, S, ...) by taking their first index -- mirrors scoper.py's
+    `TifImage._to_yxc` so a grid aligned here translates directly for that package.
+    """
+    with tifffile.TiffFile(file_obj) as tif:
+        series = tif.series[0]
+        array = series.asarray()
+        axes = series.axes.upper()
+
+    extra_axes = [a for a in axes if a not in "YXC"]
+    for ax in extra_axes:
+        idx = axes.index(ax)
+        array = np.take(array, 0, axis=idx)
+        axes = axes[:idx] + axes[idx + 1:]
+
+    y_idx, x_idx = axes.index("Y"), axes.index("X")
+    if "C" in axes:
+        c_idx = axes.index("C")
+        array = np.moveaxis(array, (y_idx, x_idx, c_idx), (0, 1, 2))
+    else:
+        array = np.moveaxis(array, (y_idx, x_idx), (0, 1))
+        array = array[..., np.newaxis]
+    return array
+
+
+def _decode_tif_from_b64(content_string):
+    """Decode+parse a TIF upload's base64 payload, cached by content hash so switching the
+    "Channel" selector (which re-triggers `update_image`) doesn't re-parse the whole TIF.
+    Only the single most recent upload is kept (bounded memory, matches `_uploaded_tif_array`
+    tracking one upload at a time).
+    """
+    key = hashlib.md5(content_string.encode('ascii')).hexdigest()
+    if key not in _tif_decode_cache:
+        decoded = base64.b64decode(content_string)
+        _tif_decode_cache.clear()
+        _tif_decode_cache[key] = _load_tif_array(BytesIO(decoded))
+    return _tif_decode_cache[key]
+
+
+def _normalize_to_uint8(plane, low_pct=1.0, high_pct=99.5):
+    """Percentile-stretch a single channel plane (any dtype) to a viewable uint8 grayscale
+    image. Microscopy TIFs are commonly 16-bit with a handful of hot outlier pixels, so a
+    plain min/max stretch tends to wash out everything else -- percentile clipping keeps the
+    preview usable for alignment purposes.
+    """
+    plane = plane.astype(np.float32)
+    lo, hi = np.percentile(plane, [low_pct, high_pct])
+    if hi <= lo:
+        return np.zeros(plane.shape, dtype=np.uint8)
+    stretched = np.clip((plane - lo) / (hi - lo), 0, 1) * 255
+    return stretched.astype(np.uint8)
 
 
 def _pil_to_b64(img, fmt='JPEG'):
@@ -143,6 +218,18 @@ app.layout = html.Div([
                 accept='image/*,.tif,.tiff,.jpg,.jpeg,.png'
             )
         ]),
+
+        # ── TIF channel selector (only relevant/shown for TIF uploads) ─
+        html.Div(id='tif-channel-container', children=[
+            html.Label("Channel", style=_label_style),
+            dcc.Input(
+                id='tif-channel-input', type='number', min=0, step=1, value=0,
+                style={'width': '100%', 'backgroundColor': '#333', 'color': '#ddd',
+                       'border': '1px solid #555', 'borderRadius': '4px', 'padding': '6px'}
+            ),
+            html.Div(id='tif-channel-hint', style={'color': '#888', 'fontFamily': 'sans-serif',
+                                                     'fontSize': '0.75em', 'marginTop': '3px'})
+        ], style={'marginBottom': '15px', 'display': 'none'}),
 
         # ── Interactive Controls ───────────────────────────────────
         html.Div([
@@ -408,11 +495,13 @@ app.layout = html.Div([
 @app.callback(
     Output('image-store', 'data'),
     [Input('upload-image', 'contents'),
-     Input('rotation-slider', 'value')],
+     Input('rotation-slider', 'value'),
+     Input('tif-channel-input', 'value')],
+    State('upload-image', 'filename'),
     prevent_initial_call='initial_duplicate'
 )
-def update_image(upload_contents, rotation):
-    global _uploaded_image
+def update_image(upload_contents, rotation, channel, upload_filename):
+    global _uploaded_image, _uploaded_tif_array
 
     ctx = dash.callback_context
     trigger_id = ctx.triggered[0]['prop_id'] if ctx.triggered else '.'
@@ -421,17 +510,54 @@ def update_image(upload_contents, rotation):
         if upload_contents is not None:
             try:
                 _, content_string = upload_contents.split(',')
-                decoded = base64.b64decode(content_string)
-                _uploaded_image = ImageOps.exif_transpose(Image.open(BytesIO(decoded))).convert('RGB')
+                is_tif = bool(upload_filename) and upload_filename.lower().endswith(('.tif', '.tiff'))
+                if is_tif:
+                    _uploaded_tif_array = _decode_tif_from_b64(content_string)
+                    _uploaded_image = None
+                else:
+                    decoded = base64.b64decode(content_string)
+                    _uploaded_image = ImageOps.exif_transpose(Image.open(BytesIO(decoded))).convert('RGB')
+                    _uploaded_tif_array = None
             except Exception:
                 pass
         else:
             _uploaded_image = None
+            _uploaded_tif_array = None
+
+    # TIFs may hold more channels than can be shown at once -- render whichever one the
+    # "Channel" control currently selects (clamped to a valid index) as a grayscale image, and
+    # store it in `_uploaded_image` so every other callback in this app (which all just read
+    # that global directly) keeps working unchanged.
+    n_channels = 1
+    source = 'jpg'
+    if _uploaded_tif_array is not None:
+        n_channels = _uploaded_tif_array.shape[2]
+        ch = min(max(int(channel or 0), 0), n_channels - 1)
+        plane = _normalize_to_uint8(_uploaded_tif_array[:, :, ch])
+        _uploaded_image = Image.fromarray(plane, mode='L')
+        source = 'tif'
 
     # Always generate rotated data
     current = _uploaded_image if _uploaded_image is not None else original_image
     data = _get_rotated_data(current, rotation)
-    return {'b64': data['b64'], 'w': data['w'], 'h': data['h'], 'pw': data['pw'], 'ph': data['ph']}
+    return {'b64': data['b64'], 'w': data['w'], 'h': data['h'], 'pw': data['pw'], 'ph': data['ph'],
+            'source': source, 'n_channels': n_channels}
+
+
+# ── One-directional: toggle/label the Channel control based on the active upload's source ──
+@app.callback(
+    [Output('tif-channel-container', 'style'),
+     Output('tif-channel-hint', 'children')],
+    Input('image-store', 'data')
+)
+def update_channel_ui(img_data):
+    if not img_data or img_data.get('source') != 'tif':
+        return {'marginBottom': '15px', 'display': 'none'}, ''
+    n_channels = img_data.get('n_channels', 1)
+    return (
+        {'marginBottom': '15px', 'display': 'block'},
+        f'Valid range: 0-{n_channels - 1} ({n_channels} channel{"s" if n_channels != 1 else ""})'
+    )
 
 
 
@@ -781,28 +907,34 @@ def compute_fluorescence(n_clicks, rotation, spacing, offset_x, offset_y, center
     n_rows = max(0, len(y_pos) - 1)
     n_cols = max(0, len(x_pos) - 1)
 
-    # Channel mapping: map fluorophore names to RGB extraction logic
-    channel_map = {
-        'r': lambda c: c[:, :, 0].astype(float),
-        'g': lambda c: c[:, :, 1].astype(float),
-        'b': lambda c: c[:, :, 2].astype(float),
-        'cyan': lambda c: (c[:, :, 1].astype(float) + c[:, :, 2].astype(float)) / 2,
-        'magenta': lambda c: (c[:, :, 0].astype(float) + c[:, :, 2].astype(float)) / 2,
-        'yellow': lambda c: (c[:, :, 0].astype(float) + c[:, :, 1].astype(float)) / 2,
-        'dapi': lambda c: c[:, :, 2].astype(float),
-        'fitc': lambda c: c[:, :, 1].astype(float),
-        'tritc': lambda c: c[:, :, 0].astype(float),
-        'cy5': lambda c: (c[:, :, 0].astype(float) * 0.8 + c[:, :, 2].astype(float) * 0.2),
-        'mcherry': lambda c: c[:, :, 0].astype(float),
-        'cfp': lambda c: (c[:, :, 1].astype(float) + c[:, :, 2].astype(float)) / 2,
-        'yfp': lambda c: (c[:, :, 0].astype(float) * 0.3 + c[:, :, 1].astype(float) * 0.7),
-        'brightfield': lambda c: (0.2126 * c[:, :, 0].astype(float) +
-                                   0.7152 * c[:, :, 1].astype(float) +
-                                   0.0722 * c[:, :, 2].astype(float)),
-        'mean': lambda c: c.astype(float).mean(axis=2),
-    }
-    extract = channel_map.get(channel, channel_map['mean'])
-    extracted_arr = extract(arr)
+    if arr.ndim == 2:
+        # Grayscale (a single TIF channel, selected via the "Channel" control) -- there's only
+        # one plane of data, so the RGB-fluorophore channel mapping below doesn't apply; just
+        # use it directly regardless of the `channel` dropdown's selection.
+        extracted_arr = arr.astype(float)
+    else:
+        # Channel mapping: map fluorophore names to RGB extraction logic
+        channel_map = {
+            'r': lambda c: c[:, :, 0].astype(float),
+            'g': lambda c: c[:, :, 1].astype(float),
+            'b': lambda c: c[:, :, 2].astype(float),
+            'cyan': lambda c: (c[:, :, 1].astype(float) + c[:, :, 2].astype(float)) / 2,
+            'magenta': lambda c: (c[:, :, 0].astype(float) + c[:, :, 2].astype(float)) / 2,
+            'yellow': lambda c: (c[:, :, 0].astype(float) + c[:, :, 1].astype(float)) / 2,
+            'dapi': lambda c: c[:, :, 2].astype(float),
+            'fitc': lambda c: c[:, :, 1].astype(float),
+            'tritc': lambda c: c[:, :, 0].astype(float),
+            'cy5': lambda c: (c[:, :, 0].astype(float) * 0.8 + c[:, :, 2].astype(float) * 0.2),
+            'mcherry': lambda c: c[:, :, 0].astype(float),
+            'cfp': lambda c: (c[:, :, 1].astype(float) + c[:, :, 2].astype(float)) / 2,
+            'yfp': lambda c: (c[:, :, 0].astype(float) * 0.3 + c[:, :, 1].astype(float) * 0.7),
+            'brightfield': lambda c: (0.2126 * c[:, :, 0].astype(float) +
+                                       0.7152 * c[:, :, 1].astype(float) +
+                                       0.0722 * c[:, :, 2].astype(float)),
+            'mean': lambda c: c.astype(float).mean(axis=2),
+        }
+        extract = channel_map.get(channel, channel_map['mean'])
+        extracted_arr = extract(arr)
 
     values = []
     for r in range(n_rows):
@@ -1180,6 +1312,7 @@ def save_csv(n_clicks, fluor_data):
 def save_settings(n_clicks, rotation, spacing_x, spacing_y, link_spacing, offset_x, offset_y, center_point, opacity, show_labels, c_top, c_bot, c_left, c_right, filename):
     settings = {
         'schema_version': SETTINGS_SCHEMA_VERSION,
+        'source': 'tif' if _uploaded_tif_array is not None else 'jpg',
         'rotation': rotation,
         'grid_spacing': spacing_x,
         'grid_y_spacing': spacing_y,
@@ -1237,9 +1370,11 @@ def load_settings(contents):
         # Backwards compatibility: legacy files (no/old schema_version) had purely cosmetic
         # crop sliders, so ignore any stored crop values rather than treating them as real
         # bounds. To opt an old file into the new functional-crop behavior, manually add
-        # `"schema_version": 2` to its JSON.
+        # `"schema_version": 2` to its JSON. (Compared against the fixed `CROP_SCHEMA_VERSION`
+        # threshold, not `SETTINGS_SCHEMA_VERSION` -- the latter just tracks the current format
+        # this app writes and has since moved on to 3 for the "source" field.)
         schema_version = s.get('schema_version', 1)
-        if schema_version >= SETTINGS_SCHEMA_VERSION:
+        if schema_version >= CROP_SCHEMA_VERSION:
             crop_top = s.get('crop_top', 0)
             crop_bottom = s.get('crop_bottom', 0)
             crop_left = s.get('crop_left', 0)
