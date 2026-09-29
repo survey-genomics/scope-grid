@@ -225,8 +225,14 @@ app.layout = html.Div([
                     'marginBottom': '15px', 'color': '#bbbbbb',
                     'borderColor': '#777', 'cursor': 'pointer', 'fontSize': '0.85em'
                 },
-                multiple=False,
-                accept='image/*,.tif,.tiff,.jpg,.jpeg,.png'
+                multiple=False
+                # NOTE: deliberately no `accept=` filter here. dcc.Upload (react-dropzone)
+                # enforces `accept` client-side by sniffing the file's MIME type, and browsers
+                # frequently misdetect/blank the MIME type for double-extension files like
+                # ".ome.tif" (instead of a clean "image/tiff") -- this silently dropped such
+                # files with ZERO feedback (no server request, no error, no spinner) before the
+                # Python callback ever ran. Server-side validation (filename-extension sniffing
+                # in `update_image`, now with real error logging) is the actual gate.
             )
         ]),
 
