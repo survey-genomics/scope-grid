@@ -12,6 +12,18 @@ import string
 
 app = dash.Dash(__name__, title="Microscopy Grid Aligner")
 
+# ── Settings JSON schema version ────────────────────────────────────────
+# 1 (implicit — the key is absent from the JSON entirely): crop sliders were purely cosmetic
+#   and never restricted anything (pre-"Section Crop"). Files saved by that older version of
+#   this app have no `schema_version` key at all.
+# 2: "Section Crop" is functional — crop_top/bottom/left/right are real bounds that restrict
+#   the grid/wells/exports. Every save from this version of the app writes `schema_version: 2`.
+#
+# `load_settings` uses this to stay backwards compatible: legacy files (schema_version < 2)
+# have their stored crop values ignored on load (reset to 0), so old alignments open exactly
+# as they looked when they were saved, instead of suddenly being clipped by cosmetic leftovers.
+SETTINGS_SCHEMA_VERSION = 2
+
 # ── Load sample image ──────────────────────────────────────────────────
 try:
     url = "https://raw.githubusercontent.com/scikit-image/scikit-image/main/skimage/data/immunohistochemistry.png"
@@ -209,31 +221,33 @@ app.layout = html.Div([
         
         # ── Image Cropping ──────────────────────────────────────────
         html.Hr(style={'borderColor': '#444', 'margin': '12px 0'}),
-        html.Label("Image Cropping (%)", style={
+        html.Label("Section Crop (%)", style={
             'color': '#ffffff', 'fontFamily': 'sans-serif',
-            'fontWeight': 'bold', 'marginBottom': '8px', 'display': 'block'
+            'fontWeight': 'bold', 'marginBottom': '4px', 'display': 'block'
         }),
-        
+        html.Div(
+            "Restricts the grid/wells/fluorescence/exports to this region. Does not modify "
+            "the underlying image — use this to isolate one tissue section at a time and "
+            "save each section as its own settings file.",
+            style={'color': '#888', 'fontFamily': 'sans-serif', 'fontSize': '0.75em', 'marginBottom': '8px'}
+        ),
+
         html.Div([
-            html.Label("Top Wall", style=_label_style),
+            html.Label("Crop Top", style=_label_style),
             dcc.Slider(id='crop-top-slider', min=0, max=99, step=0.1, value=0, updatemode='drag', tooltip={"placement": "bottom", "always_visible": False})
         ], style={'marginBottom': '5px'}),
         html.Div([
-            html.Label("Bottom Wall", style=_label_style),
+            html.Label("Crop Bottom", style=_label_style),
             dcc.Slider(id='crop-bottom-slider', min=0, max=99, step=0.1, value=0, updatemode='drag', tooltip={"placement": "bottom", "always_visible": False})
         ], style={'marginBottom': '5px'}),
         html.Div([
-            html.Label("Left Wall", style=_label_style),
+            html.Label("Crop Left", style=_label_style),
             dcc.Slider(id='crop-left-slider', min=0, max=99, step=0.1, value=0, updatemode='drag', tooltip={"placement": "bottom", "always_visible": False})
         ], style={'marginBottom': '5px'}),
         html.Div([
-            html.Label("Right Wall", style=_label_style),
+            html.Label("Crop Right", style=_label_style),
             dcc.Slider(id='crop-right-slider', min=0, max=99, step=0.1, value=0, updatemode='drag', tooltip={"placement": "bottom", "always_visible": False})
         ], style={'marginBottom': '10px'}),
-        
-        html.Button("✂️ Apply Crop", id='btn-apply-crop', n_clicks=0, style=_btn_style),
-        html.Button("🔄 Reset Image", id='btn-reset-crop', n_clicks=0, style=_btn_style),
-
 
         html.Div([
             html.Label("Show Well Labels", style=_label_style),
@@ -390,86 +404,38 @@ app.layout = html.Div([
 ], style={'margin': '0', 'padding': '0', 'display': 'flex'})
 
 
-# ── Server callback: image processor (upload, rotate, crop, reset) ─────
+# ── Server callback: image processor (upload, rotate) ──────────────────
 @app.callback(
-    [Output('image-store', 'data'),
-     Output('crop-top-slider', 'value'),
-     Output('crop-bottom-slider', 'value'),
-     Output('crop-left-slider', 'value'),
-     Output('crop-right-slider', 'value'),
-     Output('grid-x-offset-slider', 'value', allow_duplicate=True),
-     Output('grid-y-offset-slider', 'value', allow_duplicate=True),
-     Output('center-point-store', 'data', allow_duplicate=True),
-     Output('center-point-display', 'children', allow_duplicate=True),
-     Output('status-text', 'children', allow_duplicate=True)],
+    Output('image-store', 'data'),
     [Input('upload-image', 'contents'),
-     Input('rotation-slider', 'value'),
-     Input('btn-apply-crop', 'n_clicks'),
-     Input('btn-reset-crop', 'n_clicks')],
-    [State('crop-top-slider', 'value'),
-     State('crop-bottom-slider', 'value'),
-     State('crop-left-slider', 'value'),
-     State('crop-right-slider', 'value')],
+     Input('rotation-slider', 'value')],
     prevent_initial_call='initial_duplicate'
 )
-def update_image_and_crop(upload_contents, rotation, btn_crop, btn_reset, c_top, c_bot, c_left, c_right):
-    global _raw_uploaded_image, _uploaded_image
-    
+def update_image(upload_contents, rotation):
+    global _uploaded_image
+
     ctx = dash.callback_context
     trigger_id = ctx.triggered[0]['prop_id'] if ctx.triggered else '.'
-    
-    # Initialize / Upload
-    if trigger_id == '.' or trigger_id == 'upload-image.contents':
-        if trigger_id == 'upload-image.contents' and upload_contents is not None:
+
+    if trigger_id == 'upload-image.contents':
+        if upload_contents is not None:
             try:
                 _, content_string = upload_contents.split(',')
                 decoded = base64.b64decode(content_string)
-                img = ImageOps.exif_transpose(Image.open(BytesIO(decoded))).convert('RGB')
-                _raw_uploaded_image = img
-                _uploaded_image = img.copy()
+                _uploaded_image = ImageOps.exif_transpose(Image.open(BytesIO(decoded))).convert('RGB')
             except Exception:
                 pass
         else:
-            _raw_uploaded_image = None
             _uploaded_image = None
-            
-    # Reset
-    elif trigger_id == 'btn-reset-crop.n_clicks':
-        if _raw_uploaded_image is not None:
-            _uploaded_image = _raw_uploaded_image.copy()
-        else:
-            _uploaded_image = None # This will fall back to original_image
-            
-    # Crop
-    elif trigger_id == 'btn-apply-crop.n_clicks':
-        current = _uploaded_image if _uploaded_image is not None else original_image
-        w, h = current.size
-        # Calculate pixel boundaries based on percentages
-        left = int(w * (c_left / 100.0))
-        top = int(h * (c_top / 100.0))
-        right = int(w * (1 - c_right / 100.0))
-        bottom = int(h * (1 - c_bot / 100.0))
-        
-        # Ensure valid crop box
-        if left < right and top < bottom:
-            if _uploaded_image is None:
-                _uploaded_image = original_image.crop((left, top, right, bottom))
-                _raw_uploaded_image = original_image.copy()
-            else:
-                _uploaded_image = _uploaded_image.crop((left, top, right, bottom))
-    
+
     # Always generate rotated data
     current = _uploaded_image if _uploaded_image is not None else original_image
     data = _get_rotated_data(current, rotation)
-    
-    if trigger_id in ['btn-apply-crop.n_clicks', 'btn-reset-crop.n_clicks']:
-        return {'b64': data['b64'], 'w': data['w'], 'h': data['h'], 'pw': data['pw'], 'ph': data['ph']}, 0, 0, 0, 0, 0, 0, {'x': 0.0, 'y': 0.0}, "Center Point: (0.0, 0.0)", "✅ Image updated!"
-    else:
-        return {'b64': data['b64'], 'w': data['w'], 'h': data['h'], 'pw': data['pw'], 'ph': data['ph']}, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    return {'b64': data['b64'], 'w': data['w'], 'h': data['h'], 'pw': data['pw'], 'ph': data['ph']}
 
 
 
-# ── Clientside callback: figure with grid + well labels + fluorescence + crop walls ──
+# ── Clientside callback: figure with grid + well labels + fluorescence + section bounds ──
 app.clientside_callback(
     """
     function(imgData, centerPoint, gridSpacingX, gridSpacingY, linkSpacing, offsetX, offsetY, gridOpacity, showLabels, flourData, showFluor, cropTop, cropBottom, cropLeft, cropRight, relayoutData) {
@@ -498,48 +464,57 @@ app.clientside_callback(
         var doLabels = showLabels && showLabels.indexOf('show') !== -1;
         var doFluor = showFluor && showFluor.indexOf('show') !== -1 && flourData && flourData.values;
 
-        // Build grid shapes & crop walls
+        // Section crop bounds: restricts grid/wells to this box (never modifies the image)
+        var boundX0 = imgW * (cropLeft / 100);
+        var boundX1 = imgW * (1 - cropRight / 100);
+        var boundY0 = imgH * (cropTop / 100);
+        var boundY1 = imgH * (1 - cropBottom / 100);
+
         var shapes = [];
+        var dimColor = 'rgba(0, 0, 0, 0.7)';
+        if (boundY0 > 0) {
+            shapes.push({type: 'rect', x0: 0, y0: 0, x1: imgW, y1: boundY0, fillcolor: dimColor, line: {width: 0}});
+        }
+        if (boundY1 < imgH) {
+            shapes.push({type: 'rect', x0: 0, y0: boundY1, x1: imgW, y1: imgH, fillcolor: dimColor, line: {width: 0}});
+        }
+        if (boundX0 > 0) {
+            shapes.push({type: 'rect', x0: 0, y0: boundY0, x1: boundX0, y1: boundY1, fillcolor: dimColor, line: {width: 0}});
+        }
+        if (boundX1 < imgW) {
+            shapes.push({type: 'rect', x0: boundX1, y0: boundY0, x1: imgW, y1: boundY1, fillcolor: dimColor, line: {width: 0}});
+        }
+        // Outline of the active section bounds
+        shapes.push({
+            type: 'rect', x0: boundX0, y0: boundY0, x1: boundX1, y1: boundY1,
+            line: {color: 'rgba(255, 255, 0, 0.6)', width: 1.5}, fillcolor: 'rgba(0,0,0,0)'
+        });
 
-        var cropColor = 'rgba(0, 0, 0, 0.7)';
-        if (cropTop > 0) {
-            var th = imgH * (cropTop / 100);
-            shapes.push({type: 'rect', x0: 0, y0: 0, x1: imgW, y1: th, fillcolor: cropColor, line: {width: 0}});
-        }
-        if (cropBottom > 0) {
-            var bh = imgH * (cropBottom / 100);
-            shapes.push({type: 'rect', x0: 0, y0: imgH - bh, x1: imgW, y1: imgH, fillcolor: cropColor, line: {width: 0}});
-        }
-        if (cropLeft > 0) {
-            var lw = imgW * (cropLeft / 100);
-            shapes.push({type: 'rect', x0: 0, y0: 0, x1: lw, y1: imgH, fillcolor: cropColor, line: {width: 0}});
-        }
-        if (cropRight > 0) {
-            var rw = imgW * (cropRight / 100);
-            shapes.push({type: 'rect', x0: imgW - rw, y0: 0, x1: imgW, y1: imgH, fillcolor: cropColor, line: {width: 0}});
-        }
-
-        // Compute grid line positions
+        // Compute grid line positions, clipped to the section bounds
         var startX = ((trueOffsetX % spacingX) + spacingX) % spacingX;
         var xPositions = [];
         for (var x = startX; x < imgW; x += spacingX) {
-            xPositions.push(x);
-            shapes.push({
-                type: 'line', x0: x, x1: x, y0: 0, y1: imgH,
-                line: {color: gridColor, width: 1.5},
-                editable: false
-            });
+            if (x >= boundX0 && x <= boundX1) {
+                xPositions.push(x);
+                shapes.push({
+                    type: 'line', x0: x, x1: x, y0: boundY0, y1: boundY1,
+                    line: {color: gridColor, width: 1.5},
+                    editable: false
+                });
+            }
         }
 
         var startY = ((trueOffsetY % spacingY) + spacingY) % spacingY;
         var yPositions = [];
         for (var y = startY; y < imgH; y += spacingY) {
-            yPositions.push(y);
-            shapes.push({
-                type: 'line', x0: 0, x1: imgW, y0: y, y1: y,
-                line: {color: gridColor, width: 1.5},
-                editable: false
-            });
+            if (y >= boundY0 && y <= boundY1) {
+                yPositions.push(y);
+                shapes.push({
+                    type: 'line', x0: boundX0, x1: boundX1, y0: y, y1: y,
+                    line: {color: gridColor, width: 1.5},
+                    editable: false
+                });
+            }
         }
 
         // Add a visible center point shape
@@ -738,8 +713,22 @@ app.clientside_callback(
 )
 
 # ── Helper: compute grid positions ─────────────────────────────────────
-def _grid_positions(spacing, offset_x, offset_y, w, h):
-    """Return lists of x and y grid line positions."""
+def _crop_bounds(w, h, crop_top, crop_bottom, crop_left, crop_right):
+    """Pixel-space (x0, y0, x1, y1) bounds for the section crop.
+
+    Unlike the old "Apply Crop" button, this never modifies image pixels — it only
+    restricts which grid lines/wells are computed/exported, so a single uploaded image
+    can be divided into multiple independently-aligned sections (one settings file each).
+    """
+    x0 = w * (crop_left / 100.0)
+    x1 = w * (1 - crop_right / 100.0)
+    y0 = h * (crop_top / 100.0)
+    y1 = h * (1 - crop_bottom / 100.0)
+    return x0, y0, x1, y1
+
+
+def _grid_positions(spacing, offset_x, offset_y, w, h, bounds=None):
+    """Return lists of x and y grid line positions, optionally clipped to `bounds` (x0, y0, x1, y1)."""
     x_pos = []
     sx = offset_x % spacing
     x = sx
@@ -752,6 +741,10 @@ def _grid_positions(spacing, offset_x, offset_y, w, h):
     while y < h:
         y_pos.append(y)
         y += spacing
+    if bounds is not None:
+        x0, y0, x1, y1 = bounds
+        x_pos = [x for x in x_pos if x0 <= x <= x1]
+        y_pos = [y for y in y_pos if y0 <= y <= y1]
     return x_pos, y_pos
 
 
@@ -764,10 +757,15 @@ def _grid_positions(spacing, offset_x, offset_y, w, h):
      State('grid-x-offset-slider', 'value'),
      State('grid-y-offset-slider', 'value'),
      State('center-point-store', 'data'),
-     State('fluor-channel', 'value')],
+     State('fluor-channel', 'value'),
+     State('crop-top-slider', 'value'),
+     State('crop-bottom-slider', 'value'),
+     State('crop-left-slider', 'value'),
+     State('crop-right-slider', 'value')],
     prevent_initial_call=True
 )
-def compute_fluorescence(n_clicks, rotation, spacing, offset_x, offset_y, center_point, channel):
+def compute_fluorescence(n_clicks, rotation, spacing, offset_x, offset_y, center_point, channel,
+                          c_top, c_bot, c_left, c_right):
     cx = center_point.get('x', 0) if center_point else 0
     cy = center_point.get('y', 0) if center_point else 0
     true_offset_x = cx + offset_x
@@ -777,7 +775,8 @@ def compute_fluorescence(n_clicks, rotation, spacing, offset_x, offset_y, center
     rotated = _get_rotated_pil(current, rotation)
     arr = np.array(rotated)
     w, h = rotated.size
-    x_pos, y_pos = _grid_positions(spacing, true_offset_x, true_offset_y, w, h)
+    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
+    x_pos, y_pos = _grid_positions(spacing, true_offset_x, true_offset_y, w, h, bounds=bounds)
 
     n_rows = max(0, len(y_pos) - 1)
     n_cols = max(0, len(x_pos) - 1)
@@ -892,13 +891,21 @@ def update_matrix_graph(fluor_data):
     [Input('image-store', 'data'),
      Input('grid-spacing-slider', 'value'),
      Input('grid-x-offset-slider', 'value'),
-     Input('grid-y-offset-slider', 'value')]
+     Input('grid-y-offset-slider', 'value'),
+     Input('center-point-store', 'data'),
+     Input('crop-top-slider', 'value'),
+     Input('crop-bottom-slider', 'value'),
+     Input('crop-left-slider', 'value'),
+     Input('crop-right-slider', 'value')]
 )
-def update_well_options(img_data, spacing, offset_x, offset_y):
+def update_well_options(img_data, spacing, offset_x, offset_y, center_point, c_top, c_bot, c_left, c_right):
     if not img_data:
         return []
     w, h = img_data['w'], img_data['h']
-    x_pos, y_pos = _grid_positions(spacing, offset_x, offset_y, w, h)
+    cx = center_point.get('x', 0) if center_point else 0
+    cy = center_point.get('y', 0) if center_point else 0
+    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
+    x_pos, y_pos = _grid_positions(spacing, cx + offset_x, cy + offset_y, w, h, bounds=bounds)
     n_rows = max(0, len(y_pos) - 1)
     n_cols = max(0, len(x_pos) - 1)
     
@@ -924,17 +931,26 @@ def update_well_options(img_data, spacing, offset_x, offset_y):
      State('rotation-slider', 'value'),
      State('grid-spacing-slider', 'value'),
      State('grid-x-offset-slider', 'value'),
-     State('grid-y-offset-slider', 'value')],
+     State('grid-y-offset-slider', 'value'),
+     State('center-point-store', 'data'),
+     State('crop-top-slider', 'value'),
+     State('crop-bottom-slider', 'value'),
+     State('crop-left-slider', 'value'),
+     State('crop-right-slider', 'value')],
     prevent_initial_call=True
 )
-def crop_well(n_clicks, well_value, rotation, spacing, offset_x, offset_y):
+def crop_well(n_clicks, well_value, rotation, spacing, offset_x, offset_y, center_point,
+              c_top, c_bot, c_left, c_right):
     if not well_value:
         raise dash.exceptions.PreventUpdate
     r, c = [int(v) for v in well_value.split(',')]
     current = _uploaded_image if _uploaded_image is not None else original_image
     rotated = _get_rotated_pil(current, rotation)
     w, h = rotated.size
-    x_pos, y_pos = _grid_positions(spacing, offset_x, offset_y, w, h)
+    cx = center_point.get('x', 0) if center_point else 0
+    cy = center_point.get('y', 0) if center_point else 0
+    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
+    x_pos, y_pos = _grid_positions(spacing, cx + offset_x, cy + offset_y, w, h, bounds=bounds)
 
     x0 = int(round(x_pos[c]))
     x1 = int(round(x_pos[c + 1]))
@@ -973,20 +989,29 @@ def save_image(n_clicks, rotation):
      State('grid-spacing-slider', 'value'),
      State('grid-x-offset-slider', 'value'),
      State('grid-y-offset-slider', 'value'),
+     State('center-point-store', 'data'),
      State('grid-opacity-slider', 'value'),
-     State('show-labels-check', 'value')],
+     State('show-labels-check', 'value'),
+     State('crop-top-slider', 'value'),
+     State('crop-bottom-slider', 'value'),
+     State('crop-left-slider', 'value'),
+     State('crop-right-slider', 'value')],
     prevent_initial_call=True
 )
-def save_grid(n_clicks, rotation, spacing, offset_x, offset_y, opacity, show_labels):
+def save_grid(n_clicks, rotation, spacing, offset_x, offset_y, center_point, opacity, show_labels,
+              c_top, c_bot, c_left, c_right):
     current = _uploaded_image if _uploaded_image is not None else original_image
     rotated = _get_rotated_pil(current, rotation)
     w, h = rotated.size
+    cx = center_point.get('x', 0) if center_point else 0
+    cy = center_point.get('y', 0) if center_point else 0
+    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
     grid_img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(grid_img)
     alpha = int(opacity * 255)
     color = (0, 255, 255, alpha)
 
-    col_positions, row_positions = _grid_positions(spacing, offset_x, offset_y, w, h)
+    col_positions, row_positions = _grid_positions(spacing, cx + offset_x, cy + offset_y, w, h, bounds=bounds)
     for x in col_positions:
         draw.line([(x, 0), (x, h)], fill=color, width=2)
     for y in row_positions:
@@ -1022,16 +1047,25 @@ def save_grid(n_clicks, rotation, spacing, offset_x, offset_y, opacity, show_lab
      State('grid-spacing-slider', 'value'),
      State('grid-x-offset-slider', 'value'),
      State('grid-y-offset-slider', 'value'),
+     State('center-point-store', 'data'),
      State('grid-opacity-slider', 'value'),
      State('show-labels-check', 'value'),
      State('fluor-store', 'data'),
-     State('show-fluor-check', 'value')],
+     State('show-fluor-check', 'value'),
+     State('crop-top-slider', 'value'),
+     State('crop-bottom-slider', 'value'),
+     State('crop-left-slider', 'value'),
+     State('crop-right-slider', 'value')],
     prevent_initial_call=True
 )
-def save_merged(n_clicks, rotation, spacing, offset_x, offset_y, opacity, show_labels, fluor_data, show_fluor):
+def save_merged(n_clicks, rotation, spacing, offset_x, offset_y, center_point, opacity, show_labels,
+                 fluor_data, show_fluor, c_top, c_bot, c_left, c_right):
     current = _uploaded_image if _uploaded_image is not None else original_image
     rotated = _get_rotated_pil(current, rotation)
     w, h = rotated.size
+    cx = center_point.get('x', 0) if center_point else 0
+    cy = center_point.get('y', 0) if center_point else 0
+    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
 
     # Draw grid on RGBA overlay
     overlay = Image.new('RGBA', (w, h), (0, 0, 0, 0))
@@ -1039,7 +1073,7 @@ def save_merged(n_clicks, rotation, spacing, offset_x, offset_y, opacity, show_l
     alpha = int(opacity * 255)
     color = (0, 255, 255, alpha)
 
-    col_positions, row_positions = _grid_positions(spacing, offset_x, offset_y, w, h)
+    col_positions, row_positions = _grid_positions(spacing, cx + offset_x, cy + offset_y, w, h, bounds=bounds)
     for x in col_positions:
         draw.line([(x, 0), (x, h)], fill=color, width=2)
     for y in row_positions:
@@ -1119,6 +1153,11 @@ def save_csv(n_clicks, fluor_data):
 
 
 # ── Save grid settings ────────────────────────────────────────────────
+# `crop_top/bottom/left/right` here are real, functional section bounds (not cosmetic) —
+# they restrict which wells/grid lines are computed everywhere in this app. To align
+# multiple tissue sections on one image, set the crop box + grid for one section, save
+# settings with a distinct filename, then adjust the crop box + grid for the next
+# section and save again (all sections share the same uploaded image/rotation).
 @app.callback(
     Output('download-settings', 'data'),
     Input('btn-save-settings', 'n_clicks'),
@@ -1140,6 +1179,7 @@ def save_csv(n_clicks, fluor_data):
 )
 def save_settings(n_clicks, rotation, spacing_x, spacing_y, link_spacing, offset_x, offset_y, center_point, opacity, show_labels, c_top, c_bot, c_left, c_right, filename):
     settings = {
+        'schema_version': SETTINGS_SCHEMA_VERSION,
         'rotation': rotation,
         'grid_spacing': spacing_x,
         'grid_y_spacing': spacing_y,
@@ -1193,6 +1233,22 @@ def load_settings(contents):
         decoded = base64.b64decode(content_string).decode('utf-8')
         s = json.loads(decoded)
         cp = s.get('center_point', {'x': 0.0, 'y': 0.0})
+
+        # Backwards compatibility: legacy files (no/old schema_version) had purely cosmetic
+        # crop sliders, so ignore any stored crop values rather than treating them as real
+        # bounds. To opt an old file into the new functional-crop behavior, manually add
+        # `"schema_version": 2` to its JSON.
+        schema_version = s.get('schema_version', 1)
+        if schema_version >= SETTINGS_SCHEMA_VERSION:
+            crop_top = s.get('crop_top', 0)
+            crop_bottom = s.get('crop_bottom', 0)
+            crop_left = s.get('crop_left', 0)
+            crop_right = s.get('crop_right', 0)
+            status = '✅ Settings loaded successfully'
+        else:
+            crop_top = crop_bottom = crop_left = crop_right = 0
+            status = '✅ Settings loaded (legacy file — crop ignored; add "schema_version": 2 to the JSON to use its crop values as real bounds)'
+
         return (
             s.get('rotation', 0),
             s.get('grid_spacing', 229),
@@ -1204,11 +1260,11 @@ def load_settings(contents):
             f"Center Point: ({cp.get('x', 0)}, {cp.get('y', 0)})",
             s.get('grid_opacity', 0.7),
             s.get('show_labels', ['show']),
-            s.get('crop_top', 0),
-            s.get('crop_bottom', 0),
-            s.get('crop_left', 0),
-            s.get('crop_right', 0),
-            '✅ Settings loaded successfully'
+            crop_top,
+            crop_bottom,
+            crop_left,
+            crop_right,
+            status
         )
     except Exception as e:
         return dash.no_update, dash.no_update, dash.no_update, \
