@@ -1,7 +1,6 @@
 import dash
 from dash import dcc, html, Input, Output, State, callback_context
-import plotly.graph_objects as go
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageOps
 Image.MAX_IMAGE_PIXELS = None
 import numpy as np
 import requests
@@ -9,10 +8,10 @@ import tifffile
 import hashlib
 import traceback
 import time
+import os
 from io import BytesIO
 import base64
 import json
-import string
 
 app = dash.Dash(__name__, title="Microscopy Grid Aligner")
 
@@ -62,6 +61,20 @@ _uploaded_image = None
 # control doesn't require re-uploading.
 _uploaded_tif_array = None
 _tif_decode_cache = {}
+# Cache for TIFs loaded from a local path (keyed by path + mtime + downsample factor), bounded
+# to the most recent one. This exists so `update_image` and `reset_vmin_vmax_for_channel` --
+# two INDEPENDENT callbacks both triggered by the same `btn-load-tif-path.n_clicks` click, with
+# no Output/Input relationship between them -- each resolve the SAME array on their own rather
+# than one reading a global the other may not have written yet (Dash does not guarantee which
+# of two independently-triggered callbacks runs first). Whichever callback runs first does the
+# actual disk read and populates this cache; the other just hits it.
+_tif_path_cache = {}
+# Rotated copy of `_uploaded_tif_array` (ALL channels), cached by rotation angle -- separate
+# from `_rotation_cache` (which caches a single-channel PIL preview) because switching the
+# "Channel" selector or dragging the vmin/vmax sliders (both far more frequent than changing
+# rotation) would otherwise force a full re-rotation of the whole multi-channel array on every
+# such change. Only the most recent rotation is kept (bounded memory, one upload at a time).
+_tif_rotated_cache = {}
 
 
 def _load_tif_array(file_obj):
@@ -113,11 +126,32 @@ def _decode_tif_from_b64(content_string):
     return _tif_decode_cache[key]
 
 
+def _load_tif_path_cached(path, step):
+    """Load (and downsample) a TIF from a local path, cached by (path, mtime, step) so repeat
+    calls for the same file+downsample (e.g. from `update_image` and
+    `reset_vmin_vmax_for_channel` reacting to the same click) only hit disk once.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    key = (path, mtime, step)
+    if key not in _tif_path_cache:
+        array = _load_tif_array(path)
+        if step > 1:
+            array = array[::step, ::step, :]
+        _tif_path_cache.clear()
+        _tif_path_cache[key] = array
+    return _tif_path_cache[key]
+
+
 def _normalize_to_uint8(plane, low_pct=1.0, high_pct=99.5):
     """Percentile-stretch a single channel plane (any dtype) to a viewable uint8 grayscale
     image. Microscopy TIFs are commonly 16-bit with a handful of hot outlier pixels, so a
     plain min/max stretch tends to wash out everything else -- percentile clipping keeps the
-    preview usable for alignment purposes.
+    preview usable for alignment purposes. Used as a fallback before the vmin/vmax slider has
+    a real value (e.g. right after a TIF first loads); see `_normalize_to_uint8_range` for the
+    user-controlled version used everywhere else.
     """
     plane = plane.astype(np.float32)
     lo, hi = np.percentile(plane, [low_pct, high_pct])
@@ -125,6 +159,49 @@ def _normalize_to_uint8(plane, low_pct=1.0, high_pct=99.5):
         return np.zeros(plane.shape, dtype=np.uint8)
     stretched = np.clip((plane - lo) / (hi - lo), 0, 1) * 255
     return stretched.astype(np.uint8)
+
+
+def _normalize_to_uint8_range(plane, vmin, vmax):
+    """Linearly stretch a single channel plane to uint8 using an EXPLICIT (vmin, vmax) range
+    -- i.e. whatever the user has set via the vmin/vmax slider -- instead of automatic
+    percentile clipping. Values at/below vmin go to 0, at/above vmax go to 255.
+    """
+    plane = plane.astype(np.float32)
+    if vmax <= vmin:
+        return np.zeros(plane.shape, dtype=np.uint8)
+    stretched = np.clip((plane - vmin) / (vmax - vmin), 0, 1) * 255
+    return stretched.astype(np.uint8)
+
+
+def _rotate_multichannel(array, angle):
+    """Rotate each channel plane of a (Y, X, C) array independently via PIL -- same
+    `rotate(-angle, expand=True, resample=BILINEAR)` call (note the sign) used by
+    `_get_rotated_data` for single-channel/RGB previews, so both paths agree on rotation
+    direction.
+    """
+    if (angle or 0) % 360 == 0:
+        return array
+    dtype = array.dtype
+    channels = []
+    for i in range(array.shape[2]):
+        plane = Image.fromarray(array[:, :, i].astype(np.float32), mode='F')
+        rotated = plane.rotate(-angle, expand=True, resample=Image.BILINEAR)
+        channels.append(np.array(rotated))
+    stacked = np.stack(channels, axis=-1)
+    if np.issubdtype(dtype, np.integer):
+        stacked = np.round(stacked)
+    return stacked.astype(dtype)
+
+
+def _get_rotated_tif_array(rotation):
+    """Rotated (all channels) version of `_uploaded_tif_array`, cached by rotation angle so
+    channel switches / vmin-vmax slider drags don't re-pay for a full-array rotation.
+    """
+    key = round((rotation or 0) % 360, 6)
+    if key not in _tif_rotated_cache:
+        _tif_rotated_cache.clear()
+        _tif_rotated_cache[key] = _rotate_multichannel(_uploaded_tif_array, rotation or 0)
+    return _tif_rotated_cache[key]
 
 
 def _pil_to_b64(img, fmt='JPEG'):
@@ -169,18 +246,6 @@ def _get_rotated_pil(img, rotation):
     return _get_rotated_data(img, rotation)['img'].copy()
 
 
-def _row_label(idx):
-    """Convert row index to letter label: 0->A, 1->B, ..., 25->Z, 26->AA..."""
-    label = ''
-    i = idx
-    while True:
-        label = string.ascii_uppercase[i % 26] + label
-        i = i // 26 - 1
-        if i < 0:
-            break
-    return label
-
-
 # ── Shared styles ──────────────────────────────────────────────────────
 _btn_style = {
     'backgroundColor': '#333', 'color': '#ddd', 'border': '1px solid #555',
@@ -193,13 +258,7 @@ _label_style = {'color': '#bbbbbb', 'fontFamily': 'sans-serif', 'fontSize': '0.9
 # ── Layout ─────────────────────────────────────────────────────────────
 app.layout = html.Div([
     dcc.Store(id='image-store'),
-    dcc.Store(id='fluor-store'),
-    dcc.Download(id='download-image'),
-    dcc.Download(id='download-grid'),
-    dcc.Download(id='download-merged'),
     dcc.Download(id='download-settings'),
-    dcc.Download(id='download-crop'),
-    dcc.Download(id='download-csv'),
 
     # Left Control Panel
     html.Div([
@@ -236,16 +295,52 @@ app.layout = html.Div([
             )
         ]),
 
+        # ── TIF: load from local path (server-side, avoids the browser) ──
+        html.Div([
+            html.Label("Load TIF from local path", style={**_label_style, 'fontWeight': 'bold', 'color': '#fff'}),
+            html.Div(
+                "Reads the file directly on this machine instead of uploading it through the "
+                "browser -- avoids the browser running out of memory on large (1-2+ GiB) "
+                "whole-slide TIFs. Only works when the app and the TIF are on the same machine.",
+                style={'color': '#888', 'fontFamily': 'sans-serif', 'fontSize': '0.75em', 'marginBottom': '6px'}
+            ),
+            dcc.Input(
+                id='tif-path-input', type='text', placeholder='/path/to/image.tif',
+                style={'width': '100%', 'backgroundColor': '#333', 'color': '#ddd',
+                       'border': '1px solid #555', 'borderRadius': '4px', 'padding': '6px',
+                       'marginBottom': '6px', 'boxSizing': 'border-box'}
+            ),
+            html.Div([
+                html.Label("Downsample factor", style=_label_style),
+                dcc.Dropdown(
+                    id='tif-downsample-dropdown',
+                    options=[{'label': f'{n}x', 'value': n} for n in [1, 2, 3, 4, 5, 8, 10]],
+                    value=4, clearable=False,
+                    style={'backgroundColor': '#333', 'color': '#ddd'},
+                    className='dark-dropdown'
+                )
+            ], style={'marginBottom': '6px'}),
+            html.Button("📂  Load TIF", id='btn-load-tif-path', n_clicks=0, style=_btn_style),
+        ], style={'marginBottom': '15px'}),
+
         # ── TIF channel selector (only relevant/shown for TIF uploads) ─
         html.Div(id='tif-channel-container', children=[
             html.Label("Channel", style=_label_style),
-            dcc.Input(
-                id='tif-channel-input', type='number', min=0, step=1, value=0,
-                style={'width': '100%', 'backgroundColor': '#333', 'color': '#ddd',
-                       'border': '1px solid #555', 'borderRadius': '4px', 'padding': '6px'}
+            dcc.Dropdown(
+                id='tif-channel-dropdown', options=[], value=0, clearable=False,
+                style={'backgroundColor': '#333', 'color': '#ddd'},
+                className='dark-dropdown'
             ),
-            html.Div(id='tif-channel-hint', style={'color': '#888', 'fontFamily': 'sans-serif',
-                                                     'fontSize': '0.75em', 'marginTop': '3px'})
+        ], style={'marginBottom': '15px', 'display': 'none'}),
+
+        # ── Display range (vmin/vmax) for the current channel ──────
+        html.Div(id='vmin-vmax-container', children=[
+            html.Label("Display Range (vmin / vmax)", style=_label_style),
+            dcc.RangeSlider(
+                id='vmin-vmax-slider', min=0, max=255, step=1, value=[0, 255],
+                updatemode='drag', allowCross=False,
+                tooltip={"placement": "bottom", "always_visible": True}
+            )
         ], style={'marginBottom': '15px', 'display': 'none'}),
 
         # ── Interactive Controls ───────────────────────────────────
@@ -330,7 +425,7 @@ app.layout = html.Div([
             'fontWeight': 'bold', 'marginBottom': '4px', 'display': 'block'
         }),
         html.Div(
-            "Restricts the grid/wells/fluorescence/exports to this region. Does not modify "
+            "Restricts the grid to this region. Does not modify "
             "the underlying image — use this to isolate one tissue section at a time and "
             "save each section as its own settings file.",
             style={'color': '#888', 'fontFamily': 'sans-serif', 'fontSize': '0.75em', 'marginBottom': '8px'}
@@ -364,87 +459,12 @@ app.layout = html.Div([
             )
         ], style={'marginBottom': '15px'}),
 
-        # ── Fluorescence ───────────────────────────────────────────
-        html.Hr(style={'borderColor': '#444', 'margin': '12px 0'}),
-        html.Label("Fluorescence Analysis", style={
-            'color': '#ffffff', 'fontFamily': 'sans-serif',
-            'fontWeight': 'bold', 'marginBottom': '8px', 'display': 'block'
-        }),
-
-        html.Div([
-            html.Label("Channel", style=_label_style),
-            dcc.Dropdown(
-                id='fluor-channel',
-                options=[
-                    {'label': '── Raw Channels ──', 'value': '_sep1', 'disabled': True},
-                    {'label': 'Grayscale (mean)', 'value': 'mean'},
-                    {'label': 'Red (R)', 'value': 'r'},
-                    {'label': 'Green (G)', 'value': 'g'},
-                    {'label': 'Blue (B)', 'value': 'b'},
-                    {'label': 'Cyan (G+B)', 'value': 'cyan'},
-                    {'label': 'Magenta (R+B)', 'value': 'magenta'},
-                    {'label': 'Yellow (R+G)', 'value': 'yellow'},
-                    {'label': '── Fluorophores (Echo) ──', 'value': '_sep2', 'disabled': True},
-                    {'label': 'DAPI (Blue)', 'value': 'dapi'},
-                    {'label': 'FITC / GFP (Green)', 'value': 'fitc'},
-                    {'label': 'TRITC / Texas Red (Red)', 'value': 'tritc'},
-                    {'label': 'Cy5 (Far Red)', 'value': 'cy5'},
-                    {'label': 'mCherry / RFP (Red)', 'value': 'mcherry'},
-                    {'label': 'CFP (Cyan)', 'value': 'cfp'},
-                    {'label': 'YFP (Yellow-Green)', 'value': 'yfp'},
-                    {'label': '── Brightfield ──', 'value': '_sep3', 'disabled': True},
-                    {'label': 'Brightfield (luminance)', 'value': 'brightfield'},
-                ],
-                value='mean',
-                style={'backgroundColor': '#333', 'color': '#ddd', 'marginBottom': '8px'},
-                className='dark-dropdown'
-            ),
-        ], style={'marginBottom': '8px'}),
-
-        html.Button("🔬  Compute Fluorescence", id='btn-compute-fluor', n_clicks=0, style=_btn_style),
-
-        html.Div([
-            dcc.Checklist(
-                id='show-fluor-check',
-                options=[{'label': ' Show values on image', 'value': 'show'}],
-                value=['show'],
-                labelStyle={'color': '#bbbbbb', 'display': 'inline-block', 'marginLeft': '5px'},
-                style={'color': '#bbbbbb', 'fontFamily': 'sans-serif', 'marginTop': '3px'}
-            )
-        ], style={'marginBottom': '8px'}),
-
-        html.Button("📊  Export Matrix CSV", id='btn-save-csv', n_clicks=0, style=_btn_style),
-
-        # ── Crop Well ──────────────────────────────────────────────
-        html.Hr(style={'borderColor': '#444', 'margin': '12px 0'}),
-        html.Label("Crop Well", style={
-            'color': '#ffffff', 'fontFamily': 'sans-serif',
-            'fontWeight': 'bold', 'marginBottom': '8px', 'display': 'block'
-        }),
-
-        html.Div([
-            html.Label("Select Well", style=_label_style),
-            dcc.Dropdown(
-                id='crop-well-dropdown',
-                options=[],
-                placeholder='Select a well (e.g. A1)',
-                style={'backgroundColor': '#333', 'color': '#ddd', 'marginBottom': '8px'},
-                className='dark-dropdown'
-            ),
-        ], style={'marginBottom': '8px'}),
-
-        html.Button("✂️  Crop & Download Well", id='btn-crop-well', n_clicks=0, style=_btn_style),
-
         # ── Export & Settings ──────────────────────────────────────
         html.Hr(style={'borderColor': '#444', 'margin': '12px 0'}),
         html.Label("Export & Settings", style={
             'color': '#ffffff', 'fontFamily': 'sans-serif',
             'fontWeight': 'bold', 'marginBottom': '8px', 'display': 'block'
         }),
-
-        html.Button("💾  Save Image Only", id='btn-save-image', n_clicks=0, style=_btn_style),
-        html.Button("🔲  Save Grid Only", id='btn-save-grid', n_clicks=0, style=_btn_style),
-        html.Button("📸  Save Merged (Image + Grid)", id='btn-save-merged', n_clicks=0, style=_btn_style),
 
         html.Hr(style={'borderColor': '#444', 'margin': '12px 0'}),
 
@@ -469,18 +489,6 @@ app.layout = html.Div([
             'color': '#4CAF50', 'fontFamily': 'sans-serif',
             'fontSize': '0.85em', 'marginTop': '8px', 'minHeight': '20px'
         }),
-
-        # ── Matrix Heatmap Container ────────────────────────────────
-        html.Hr(style={'borderColor': '#444', 'margin': '12px 0'}),
-        html.Label("Fluorescence Matrix Heatmap", style={
-            'color': '#ffffff', 'fontFamily': 'sans-serif',
-            'fontWeight': 'bold', 'marginBottom': '8px', 'display': 'block'
-        }),
-        dcc.Graph(
-            id='matrix-graph',
-            style={'height': '220px', 'width': '100%'},
-            config={'displayModeBar': False}
-        ),
 
     ], style={
         'width': '28%', 'height': '100vh', 'padding': '20px',
@@ -508,23 +516,31 @@ app.layout = html.Div([
 ], style={'margin': '0', 'padding': '0', 'display': 'flex'})
 
 
-# ── Server callback: image processor (upload, rotate) ──────────────────
+# ── Server callback: image processor (upload, local-path TIF load, rotate, channel, vmin/vmax) ──
 @app.callback(
-    Output('image-store', 'data'),
+    [Output('image-store', 'data'),
+     Output('status-text', 'children', allow_duplicate=True)],
     [Input('upload-image', 'contents'),
+     Input('btn-load-tif-path', 'n_clicks'),
      Input('rotation-slider', 'value'),
-     Input('tif-channel-input', 'value')],
-    State('upload-image', 'filename'),
+     Input('tif-channel-dropdown', 'value'),
+     Input('vmin-vmax-slider', 'value')],
+    [State('upload-image', 'filename'),
+     State('tif-path-input', 'value'),
+     State('tif-downsample-dropdown', 'value')],
     prevent_initial_call='initial_duplicate'
 )
-def update_image(upload_contents, rotation, channel, upload_filename):
+def update_image(upload_contents, load_tif_clicks, rotation, channel, vmin_vmax,
+                  upload_filename, tif_path, downsample_factor):
     global _uploaded_image, _uploaded_tif_array
 
     ctx = dash.callback_context
     trigger_id = ctx.triggered[0]['prop_id'] if ctx.triggered else '.'
     print(f"[update_image] triggered by {trigger_id!r} filename={upload_filename!r} "
-          f"rotation={rotation} channel={channel} "
+          f"rotation={rotation} channel={channel} vmin_vmax={vmin_vmax} "
           f"contents_received={upload_contents is not None}", flush=True)
+
+    status = dash.no_update
 
     if trigger_id == 'upload-image.contents':
         if upload_contents is not None:
@@ -538,60 +554,181 @@ def update_image(upload_contents, rotation, channel, upload_filename):
                     decoded = base64.b64decode(content_string)
                     _uploaded_image = ImageOps.exif_transpose(Image.open(BytesIO(decoded))).convert('RGB')
                     _uploaded_tif_array = None
+                _tif_rotated_cache.clear()
                 print(f"[update_image] upload decoded OK (is_tif={is_tif})", flush=True)
+                status = f"✅ Loaded {upload_filename}"
             except Exception:
                 print(f"[update_image] FAILED to decode upload {upload_filename!r}:", flush=True)
                 traceback.print_exc()
+                status = f"❌ Failed to load {upload_filename}"
         else:
             print("[update_image] upload cleared", flush=True)
             _uploaded_image = None
             _uploaded_tif_array = None
+            _tif_rotated_cache.clear()
+
+    elif trigger_id == 'btn-load-tif-path.n_clicks':
+        if not tif_path or not tif_path.strip():
+            status = "❌ Enter a TIF path first"
+        else:
+            tif_path = tif_path.strip()
+            try:
+                t0 = time.time()
+                step = max(int(downsample_factor or 1), 1)
+                array = _load_tif_path_cached(tif_path, step)
+                _uploaded_tif_array = array
+                _uploaded_image = None
+                _tif_rotated_cache.clear()
+                print(f"[update_image] loaded TIF from path {tif_path!r}: shape={array.shape} "
+                      f"dtype={array.dtype} downsample={step}x ({time.time() - t0:.2f}s)", flush=True)
+                status = (f"✅ Loaded {tif_path} ({array.shape[1]}x{array.shape[0]}, "
+                          f"{array.shape[2]} ch, {step}x downsampled)")
+            except Exception:
+                print(f"[update_image] FAILED to load TIF from path {tif_path!r}:", flush=True)
+                traceback.print_exc()
+                status = f"❌ Failed to load {tif_path} (see server console)"
 
     # TIFs may hold more channels than can be shown at once -- render whichever one the
-    # "Channel" control currently selects (clamped to a valid index) as a grayscale image, and
-    # store it in `_uploaded_image` so every other callback in this app (which all just read
-    # that global directly) keeps working unchanged.
+    # "Channel" control currently selects (clamped to a valid index), stretched to the
+    # vmin/vmax slider's current range, as a grayscale image. Store it in `_uploaded_image` so
+    # every other callback in this app (which all just read that global directly) keeps
+    # working unchanged. The (possibly large) rotation itself is cached separately by angle
+    # (`_get_rotated_tif_array`) so only the cheap per-pixel vmin/vmax stretch re-runs when the
+    # slider is dragged or the channel is switched.
     n_channels = 1
     source = 'jpg'
     if _uploaded_tif_array is not None:
         n_channels = _uploaded_tif_array.shape[2]
         ch = min(max(int(channel or 0), 0), n_channels - 1)
-        plane = _normalize_to_uint8(_uploaded_tif_array[:, :, ch])
-        _uploaded_image = Image.fromarray(plane, mode='L')
+        rotated_array = _get_rotated_tif_array(rotation)
+        plane = rotated_array[:, :, ch]
+        if vmin_vmax and len(vmin_vmax) == 2 and vmin_vmax[1] > vmin_vmax[0]:
+            img8 = _normalize_to_uint8_range(plane, vmin_vmax[0], vmin_vmax[1])
+        else:
+            img8 = _normalize_to_uint8(plane)
+        _uploaded_image = Image.fromarray(img8, mode='L')
         source = 'tif'
         print(f"[update_image] displaying TIF channel {ch}/{n_channels - 1}, "
-              f"array shape={_uploaded_tif_array.shape}", flush=True)
+              f"vmin_vmax={vmin_vmax}, rotated array shape={rotated_array.shape}", flush=True)
+        # Already rotated above (via `_get_rotated_tif_array`) -- pass rotation=0 here so
+        # `_get_rotated_data` only thumbnails/caches the preview, without rotating again.
+        data = _get_rotated_data(_uploaded_image, 0)
+    else:
+        current = _uploaded_image if _uploaded_image is not None else original_image
+        data = _get_rotated_data(current, rotation)
 
-    # Always generate rotated data
-    current = _uploaded_image if _uploaded_image is not None else original_image
-    data = _get_rotated_data(current, rotation)
     print(f"[update_image] returning image-store data: source={source} w={data['w']} "
           f"h={data['h']}", flush=True)
     return {'b64': data['b64'], 'w': data['w'], 'h': data['h'], 'pw': data['pw'], 'ph': data['ph'],
-            'source': source, 'n_channels': n_channels}
+            'source': source, 'n_channels': n_channels}, status
 
 
-# ── One-directional: toggle/label the Channel control based on the active upload's source ──
+# ── One-directional: populate the Channel dropdown's options based on the active upload's
+# source. Deliberately never touches `tif-channel-dropdown.value` (see `reset_channel_on_new_load`
+# below) -- doing so here (driven by `image-store.data`, which `update_image` itself produces
+# FROM `tif-channel-dropdown.value`) would create a circular callback dependency.
 @app.callback(
     [Output('tif-channel-container', 'style'),
-     Output('tif-channel-hint', 'children')],
+     Output('tif-channel-dropdown', 'options')],
     Input('image-store', 'data')
 )
 def update_channel_ui(img_data):
     if not img_data or img_data.get('source') != 'tif':
-        return {'marginBottom': '15px', 'display': 'none'}, ''
+        return {'marginBottom': '15px', 'display': 'none'}, []
     n_channels = img_data.get('n_channels', 1)
-    return (
-        {'marginBottom': '15px', 'display': 'block'},
-        f'Valid range: 0-{n_channels - 1} ({n_channels} channel{"s" if n_channels != 1 else ""})'
-    )
+    options = [{'label': f'Channel {i}', 'value': i} for i in range(n_channels)]
+    return {'marginBottom': '15px', 'display': 'block'}, options
+
+
+# ── Reset the selected channel to 0 whenever a NEW file is loaded (browser upload or the
+# local-path loader) -- any previously-selected channel index may not be valid for the new
+# file. Driven only by the load events themselves, never by `image-store.data`, so this can't
+# form a cycle with `update_image` (which reads `tif-channel-dropdown.value`).
+@app.callback(
+    Output('tif-channel-dropdown', 'value'),
+    [Input('upload-image', 'contents'),
+     Input('btn-load-tif-path', 'n_clicks')],
+    prevent_initial_call=True
+)
+def reset_channel_on_new_load(contents, n_clicks):
+    return 0
+
+
+# ── Reset the vmin/vmax slider to a sensible default range whenever the channel changes OR a
+# new file loads -- using the channel's own percentile stats, same spirit as
+# `_normalize_to_uint8`'s default stretch. Also driven only by non-`image-store.data` inputs
+# (the channel dropdown's value, plus the two load events directly, in case the dropdown's
+# value doesn't actually change e.g. it's already 0) to avoid the same cycle risk.
+#
+# IMPORTANT: this callback and `update_image` are both triggered directly by
+# `upload-image.contents`/`btn-load-tif-path.n_clicks`, with no Output/Input relationship
+# between them -- Dash does NOT guarantee which one runs first. So on a fresh load, this
+# callback must NOT simply read the `_uploaded_tif_array` global (which `update_image` writes)
+# -- it might run BEFORE `update_image` has written it, silently seeing stale/None data. Instead
+# it independently re-resolves the array via the same cached helpers `update_image` uses
+# (`_decode_tif_from_b64` / `_load_tif_path_cached`), so whichever callback happens to run first
+# does the actual work and the other just hits the cache.
+@app.callback(
+    [Output('vmin-vmax-container', 'style'),
+     Output('vmin-vmax-slider', 'min'),
+     Output('vmin-vmax-slider', 'max'),
+     Output('vmin-vmax-slider', 'value')],
+    [Input('tif-channel-dropdown', 'value'),
+     Input('upload-image', 'contents'),
+     Input('btn-load-tif-path', 'n_clicks')],
+    [State('upload-image', 'filename'),
+     State('tif-path-input', 'value'),
+     State('tif-downsample-dropdown', 'value')],
+    prevent_initial_call=True
+)
+def reset_vmin_vmax_for_channel(channel, upload_contents, load_clicks,
+                                 upload_filename, tif_path, downsample_factor):
+    hidden = {'marginBottom': '15px', 'display': 'none'}, dash.no_update, dash.no_update, dash.no_update
+
+    ctx = dash.callback_context
+    trigger_id = ctx.triggered[0]['prop_id'] if ctx.triggered else '.'
+
+    array = None
+    if trigger_id == 'upload-image.contents':
+        is_tif = bool(upload_filename) and upload_filename.lower().endswith(('.tif', '.tiff'))
+        if upload_contents is not None and is_tif:
+            try:
+                _, content_string = upload_contents.split(',')
+                array = _decode_tif_from_b64(content_string)
+            except Exception:
+                return hidden
+    elif trigger_id == 'btn-load-tif-path.n_clicks':
+        if tif_path and tif_path.strip():
+            try:
+                step = max(int(downsample_factor or 1), 1)
+                array = _load_tif_path_cached(tif_path.strip(), step)
+            except Exception:
+                return hidden
+    else:
+        # Channel dropdown changed on an already-loaded file -- by the time the user can
+        # select a different channel, the dropdown's options were already populated from
+        # `image-store.data` (which only happens after `update_image` ran), so the global is
+        # guaranteed to be populated here; no race in this branch.
+        array = _uploaded_tif_array
+
+    if array is None:
+        return hidden
+
+    n_channels = array.shape[2]
+    ch = min(max(int(channel or 0), 0), n_channels - 1)
+    plane = array[:, :, ch].astype(np.float32)
+    lo, hi = float(plane.min()), float(plane.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    p_lo, p_hi = (float(v) for v in np.percentile(plane, [1.0, 99.5]))
+    return {'marginBottom': '15px', 'display': 'block'}, lo, hi, [p_lo, p_hi]
 
 
 
-# ── Clientside callback: figure with grid + well labels + fluorescence + section bounds ──
+# ── Clientside callback: figure with grid + well labels + section bounds ──
 app.clientside_callback(
     """
-    function(imgData, centerPoint, gridSpacingX, gridSpacingY, linkSpacing, offsetX, offsetY, gridOpacity, showLabels, flourData, showFluor, cropTop, cropBottom, cropLeft, cropRight, relayoutData) {
+    function(imgData, centerPoint, gridSpacingX, gridSpacingY, linkSpacing, offsetX, offsetY, gridOpacity, showLabels, cropTop, cropBottom, cropLeft, cropRight, relayoutData) {
         if (!imgData) {
             return window.dash_clientside.no_update;
         }
@@ -615,7 +752,6 @@ app.clientside_callback(
         var spacingX = Math.max(gridSpacingX, 1);
         var spacingY = isLinked ? spacingX : Math.max(gridSpacingY, 1);
         var doLabels = showLabels && showLabels.indexOf('show') !== -1;
-        var doFluor = showFluor && showFluor.indexOf('show') !== -1 && flourData && flourData.values;
 
         // Section crop bounds: restricts grid/wells to this box (never modifies the image)
         var boundX0 = imgW * (cropLeft / 100);
@@ -707,33 +843,9 @@ app.clientside_callback(
             }
         }
 
-        // Fluorescence value annotations inside each well
+        // No per-well value annotations (fluorescence analysis was removed) -- the figure
+        // never draws any.
         var annotations = [];
-        if (doFluor) {
-            var fVals = flourData.values;
-            var fRows = flourData.n_rows;
-            var fCols = flourData.n_cols;
-            for (var frow = 0; frow < fRows; frow++) {
-                for (var fcol = 0; fcol < fCols; fcol++) {
-                    if (frow < yPositions.length - 1 && fcol < xPositions.length - 1) {
-                        var fx = (xPositions[fcol] + xPositions[fcol + 1]) / 2;
-                        var fy = (yPositions[frow] + yPositions[frow + 1]) / 2;
-                        var val = fVals[frow][fcol];
-                        var fontSize = Math.min(Math.max(Math.min(spacingX, spacingY) * 0.12, 8), 14);
-                        annotations.push({
-                            x: fx, y: fy,
-                            text: val.toFixed(1),
-                            showarrow: false,
-                            font: {color: '#ffff00', size: fontSize, family: 'monospace'},
-                            xref: 'x', yref: 'y',
-                            opacity: 0.9,
-                            bgcolor: 'rgba(0,0,0,0.5)',
-                            borderpad: 2
-                        });
-                    }
-                }
-            }
-        }
 
         // Determine axis ranges (preserve zoom/pan if present)
         var xRange = [0, imgW];
@@ -803,8 +915,6 @@ app.clientside_callback(
      Input('grid-y-offset-slider', 'value'),
      Input('grid-opacity-slider', 'value'),
      Input('show-labels-check', 'value'),
-     Input('fluor-store', 'data'),
-     Input('show-fluor-check', 'value'),
      Input('crop-top-slider', 'value'),
      Input('crop-bottom-slider', 'value'),
      Input('crop-left-slider', 'value'),
@@ -864,452 +974,6 @@ app.clientside_callback(
     Output('dummy-listener', 'children'),
     Input('dummy-listener', 'id')
 )
-
-# ── Helper: compute grid positions ─────────────────────────────────────
-def _crop_bounds(w, h, crop_top, crop_bottom, crop_left, crop_right):
-    """Pixel-space (x0, y0, x1, y1) bounds for the section crop.
-
-    Unlike the old "Apply Crop" button, this never modifies image pixels — it only
-    restricts which grid lines/wells are computed/exported, so a single uploaded image
-    can be divided into multiple independently-aligned sections (one settings file each).
-    """
-    x0 = w * (crop_left / 100.0)
-    x1 = w * (1 - crop_right / 100.0)
-    y0 = h * (crop_top / 100.0)
-    y1 = h * (1 - crop_bottom / 100.0)
-    return x0, y0, x1, y1
-
-
-def _grid_positions(spacing, offset_x, offset_y, w, h, bounds=None):
-    """Return lists of x and y grid line positions, optionally clipped to `bounds` (x0, y0, x1, y1)."""
-    x_pos = []
-    sx = offset_x % spacing
-    x = sx
-    while x < w:
-        x_pos.append(x)
-        x += spacing
-    y_pos = []
-    sy = offset_y % spacing
-    y = sy
-    while y < h:
-        y_pos.append(y)
-        y += spacing
-    if bounds is not None:
-        x0, y0, x1, y1 = bounds
-        x_pos = [x for x in x_pos if x0 <= x <= x1]
-        y_pos = [y for y in y_pos if y0 <= y <= y1]
-    return x_pos, y_pos
-
-
-# ── Compute fluorescence per well ──────────────────────────────────────
-@app.callback(
-    Output('fluor-store', 'data'),
-    Input('btn-compute-fluor', 'n_clicks'),
-    [State('rotation-slider', 'value'),
-     State('grid-spacing-slider', 'value'),
-     State('grid-x-offset-slider', 'value'),
-     State('grid-y-offset-slider', 'value'),
-     State('center-point-store', 'data'),
-     State('fluor-channel', 'value'),
-     State('crop-top-slider', 'value'),
-     State('crop-bottom-slider', 'value'),
-     State('crop-left-slider', 'value'),
-     State('crop-right-slider', 'value')],
-    prevent_initial_call=True
-)
-def compute_fluorescence(n_clicks, rotation, spacing, offset_x, offset_y, center_point, channel,
-                          c_top, c_bot, c_left, c_right):
-    cx = center_point.get('x', 0) if center_point else 0
-    cy = center_point.get('y', 0) if center_point else 0
-    true_offset_x = cx + offset_x
-    true_offset_y = cy + offset_y
-
-    current = _uploaded_image if _uploaded_image is not None else original_image
-    rotated = _get_rotated_pil(current, rotation)
-    arr = np.array(rotated)
-    w, h = rotated.size
-    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
-    x_pos, y_pos = _grid_positions(spacing, true_offset_x, true_offset_y, w, h, bounds=bounds)
-
-    n_rows = max(0, len(y_pos) - 1)
-    n_cols = max(0, len(x_pos) - 1)
-
-    if arr.ndim == 2:
-        # Grayscale (a single TIF channel, selected via the "Channel" control) -- there's only
-        # one plane of data, so the RGB-fluorophore channel mapping below doesn't apply; just
-        # use it directly regardless of the `channel` dropdown's selection.
-        extracted_arr = arr.astype(float)
-    else:
-        # Channel mapping: map fluorophore names to RGB extraction logic
-        channel_map = {
-            'r': lambda c: c[:, :, 0].astype(float),
-            'g': lambda c: c[:, :, 1].astype(float),
-            'b': lambda c: c[:, :, 2].astype(float),
-            'cyan': lambda c: (c[:, :, 1].astype(float) + c[:, :, 2].astype(float)) / 2,
-            'magenta': lambda c: (c[:, :, 0].astype(float) + c[:, :, 2].astype(float)) / 2,
-            'yellow': lambda c: (c[:, :, 0].astype(float) + c[:, :, 1].astype(float)) / 2,
-            'dapi': lambda c: c[:, :, 2].astype(float),
-            'fitc': lambda c: c[:, :, 1].astype(float),
-            'tritc': lambda c: c[:, :, 0].astype(float),
-            'cy5': lambda c: (c[:, :, 0].astype(float) * 0.8 + c[:, :, 2].astype(float) * 0.2),
-            'mcherry': lambda c: c[:, :, 0].astype(float),
-            'cfp': lambda c: (c[:, :, 1].astype(float) + c[:, :, 2].astype(float)) / 2,
-            'yfp': lambda c: (c[:, :, 0].astype(float) * 0.3 + c[:, :, 1].astype(float) * 0.7),
-            'brightfield': lambda c: (0.2126 * c[:, :, 0].astype(float) +
-                                       0.7152 * c[:, :, 1].astype(float) +
-                                       0.0722 * c[:, :, 2].astype(float)),
-            'mean': lambda c: c.astype(float).mean(axis=2),
-        }
-        extract = channel_map.get(channel, channel_map['mean'])
-        extracted_arr = extract(arr)
-
-    values = []
-    for r in range(n_rows):
-        row_vals = []
-        for c in range(n_cols):
-            y0 = int(round(y_pos[r]))
-            y1 = int(round(y_pos[r + 1]))
-            x0 = int(round(x_pos[c]))
-            x1 = int(round(x_pos[c + 1]))
-            cell = extracted_arr[y0:y1, x0:x1]
-            if cell.size == 0:
-                row_vals.append(0.0)
-            else:
-                row_vals.append(float(cell.mean()))
-        values.append(row_vals)
-
-    return {'values': values, 'n_rows': n_rows, 'n_cols': n_cols, 'channel': channel}
-
-
-# ── Render Matrix Heatmap ──────────────────────────────────────────────
-@app.callback(
-    Output('matrix-graph', 'figure'),
-    Input('fluor-store', 'data')
-)
-def update_matrix_graph(fluor_data):
-    if not fluor_data or not fluor_data.get('values'):
-        # Empty placeholder figure
-        fig = go.Figure()
-        fig.update_layout(
-            paper_bgcolor='#1e1e1e', plot_bgcolor='#1e1e1e',
-            xaxis={'visible': False}, yaxis={'visible': False},
-            annotations=[{
-                'text': 'Click "Compute Fluorescence" to generate matrix',
-                'xref': 'paper', 'yref': 'paper', 'x': 0.5, 'y': 0.5,
-                'showarrow': False, 'font': {'color': '#777', 'size': 11}
-            }],
-            margin={'l': 10, 'r': 10, 't': 10, 'b': 10}
-        )
-        return fig
-
-    values = np.array(fluor_data['values'])
-    n_rows = fluor_data['n_rows']
-    n_cols = fluor_data['n_cols']
-
-    y_labels = [_row_label(r) for r in range(n_rows)]
-    x_labels = [str(c + 1) for c in range(n_cols)]
-
-    # Dynamic colorscale based on channel type
-    ch = fluor_data.get('channel', 'mean')
-    colorscale_map = {
-        'r': 'Reds', 'tritc': 'Reds', 'mcherry': 'Reds',
-        'g': 'Greens', 'fitc': 'Greens', 'yfp': 'YlGn',
-        'b': 'Blues', 'dapi': 'Blues',
-        'cyan': 'Ice', 'cfp': 'Ice',
-        'magenta': 'Purples', 'cy5': 'Plasma'
-    }
-    cs = colorscale_map.get(ch, 'Viridis')
-
-    text_vals = [[f"{v:.1f}" for v in row] for row in values]
-
-    fig = go.Figure(data=go.Heatmap(
-        z=values,
-        x=x_labels,
-        y=y_labels,
-        colorscale=cs,
-        text=text_vals,
-        texttemplate="%{text}",
-        textfont={"size": 9, "color": "white"},
-        hoverinfo="x+y+z",
-        showscale=False
-    ))
-
-    fig.update_layout(
-        paper_bgcolor='#1e1e1e',
-        plot_bgcolor='#1e1e1e',
-        xaxis={'title': 'Column', 'side': 'top', 'tickfont': {'color': '#ccc', 'size': 9}, 'titlefont': {'color': '#aaa', 'size': 10}},
-        yaxis={'title': 'Row', 'autorange': 'reversed', 'tickfont': {'color': '#ccc', 'size': 9}, 'titlefont': {'color': '#aaa', 'size': 10}},
-        margin={'l': 30, 'r': 10, 't': 35, 'b': 20}
-    )
-    return fig
-
-
-# ── Update well dropdown options ───────────────────────────────────────
-@app.callback(
-    Output('crop-well-dropdown', 'options'),
-    [Input('image-store', 'data'),
-     Input('grid-spacing-slider', 'value'),
-     Input('grid-x-offset-slider', 'value'),
-     Input('grid-y-offset-slider', 'value'),
-     Input('center-point-store', 'data'),
-     Input('crop-top-slider', 'value'),
-     Input('crop-bottom-slider', 'value'),
-     Input('crop-left-slider', 'value'),
-     Input('crop-right-slider', 'value')]
-)
-def update_well_options(img_data, spacing, offset_x, offset_y, center_point, c_top, c_bot, c_left, c_right):
-    if not img_data:
-        return []
-    w, h = img_data['w'], img_data['h']
-    cx = center_point.get('x', 0) if center_point else 0
-    cy = center_point.get('y', 0) if center_point else 0
-    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
-    x_pos, y_pos = _grid_positions(spacing, cx + offset_x, cy + offset_y, w, h, bounds=bounds)
-    n_rows = max(0, len(y_pos) - 1)
-    n_cols = max(0, len(x_pos) - 1)
-    
-    # Prevent OOM crashes by limiting the maximum number of generated options
-    max_options = 1000
-    options = []
-    
-    for r in range(n_rows):
-        for c in range(n_cols):
-            if len(options) >= max_options:
-                return options
-            label = _row_label(r) + str(c + 1)
-            options.append({'label': label, 'value': f'{r},{c}'})
-            
-    return options
-
-
-# ── Crop & download a single well ──────────────────────────────────────
-@app.callback(
-    Output('download-crop', 'data'),
-    Input('btn-crop-well', 'n_clicks'),
-    [State('crop-well-dropdown', 'value'),
-     State('rotation-slider', 'value'),
-     State('grid-spacing-slider', 'value'),
-     State('grid-x-offset-slider', 'value'),
-     State('grid-y-offset-slider', 'value'),
-     State('center-point-store', 'data'),
-     State('crop-top-slider', 'value'),
-     State('crop-bottom-slider', 'value'),
-     State('crop-left-slider', 'value'),
-     State('crop-right-slider', 'value')],
-    prevent_initial_call=True
-)
-def crop_well(n_clicks, well_value, rotation, spacing, offset_x, offset_y, center_point,
-              c_top, c_bot, c_left, c_right):
-    if not well_value:
-        raise dash.exceptions.PreventUpdate
-    r, c = [int(v) for v in well_value.split(',')]
-    current = _uploaded_image if _uploaded_image is not None else original_image
-    rotated = _get_rotated_pil(current, rotation)
-    w, h = rotated.size
-    cx = center_point.get('x', 0) if center_point else 0
-    cy = center_point.get('y', 0) if center_point else 0
-    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
-    x_pos, y_pos = _grid_positions(spacing, cx + offset_x, cy + offset_y, w, h, bounds=bounds)
-
-    x0 = int(round(x_pos[c]))
-    x1 = int(round(x_pos[c + 1]))
-    y0 = int(round(y_pos[r]))
-    y1 = int(round(y_pos[r + 1]))
-    cropped = rotated.crop((x0, y0, x1, y1))
-
-    well_name = _row_label(r) + str(c + 1)
-    buf = BytesIO()
-    cropped.save(buf, format='PNG')
-    buf.seek(0)
-    return dcc.send_bytes(buf.getvalue(), f'well_{well_name}.png')
-
-
-# ── Save image only ───────────────────────────────────────────────────
-@app.callback(
-    Output('download-image', 'data'),
-    Input('btn-save-image', 'n_clicks'),
-    [State('rotation-slider', 'value')],
-    prevent_initial_call=True
-)
-def save_image(n_clicks, rotation):
-    current = _uploaded_image if _uploaded_image is not None else original_image
-    rotated = _get_rotated_pil(current, rotation)
-    buf = BytesIO()
-    rotated.save(buf, format='PNG')
-    buf.seek(0)
-    return dcc.send_bytes(buf.getvalue(), 'microscopy_image.png')
-
-
-# ── Save grid only (transparent background) ───────────────────────────
-@app.callback(
-    Output('download-grid', 'data'),
-    Input('btn-save-grid', 'n_clicks'),
-    [State('rotation-slider', 'value'),
-     State('grid-spacing-slider', 'value'),
-     State('grid-x-offset-slider', 'value'),
-     State('grid-y-offset-slider', 'value'),
-     State('center-point-store', 'data'),
-     State('grid-opacity-slider', 'value'),
-     State('show-labels-check', 'value'),
-     State('crop-top-slider', 'value'),
-     State('crop-bottom-slider', 'value'),
-     State('crop-left-slider', 'value'),
-     State('crop-right-slider', 'value')],
-    prevent_initial_call=True
-)
-def save_grid(n_clicks, rotation, spacing, offset_x, offset_y, center_point, opacity, show_labels,
-              c_top, c_bot, c_left, c_right):
-    current = _uploaded_image if _uploaded_image is not None else original_image
-    rotated = _get_rotated_pil(current, rotation)
-    w, h = rotated.size
-    cx = center_point.get('x', 0) if center_point else 0
-    cy = center_point.get('y', 0) if center_point else 0
-    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
-    grid_img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(grid_img)
-    alpha = int(opacity * 255)
-    color = (0, 255, 255, alpha)
-
-    col_positions, row_positions = _grid_positions(spacing, cx + offset_x, cy + offset_y, w, h, bounds=bounds)
-    for x in col_positions:
-        draw.line([(x, 0), (x, h)], fill=color, width=2)
-    for y in row_positions:
-        draw.line([(0, y), (w, y)], fill=color, width=2)
-
-    if show_labels and 'show' in show_labels:
-        font_size = min(max(int(spacing * 0.15), 8), 16)
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", font_size)
-        except Exception:
-            try:
-                font = ImageFont.truetype("Arial.ttf", font_size)
-            except Exception:
-                font = ImageFont.load_default()
-        for r in range(len(row_positions) - 1):
-            for c in range(len(col_positions) - 1):
-                cx = (col_positions[c] + col_positions[c + 1]) / 2
-                cy = (row_positions[r] + row_positions[r + 1]) / 2
-                label = _row_label(r) + str(c + 1)
-                draw.text((cx, cy), label, fill=color, font=font, anchor='mm')
-
-    buf = BytesIO()
-    grid_img.save(buf, format='PNG')
-    buf.seek(0)
-    return dcc.send_bytes(buf.getvalue(), 'microscopy_grid.png')
-
-
-# ── Save merged (image + grid overlay + fluorescence) ─────────────────
-@app.callback(
-    Output('download-merged', 'data'),
-    Input('btn-save-merged', 'n_clicks'),
-    [State('rotation-slider', 'value'),
-     State('grid-spacing-slider', 'value'),
-     State('grid-x-offset-slider', 'value'),
-     State('grid-y-offset-slider', 'value'),
-     State('center-point-store', 'data'),
-     State('grid-opacity-slider', 'value'),
-     State('show-labels-check', 'value'),
-     State('fluor-store', 'data'),
-     State('show-fluor-check', 'value'),
-     State('crop-top-slider', 'value'),
-     State('crop-bottom-slider', 'value'),
-     State('crop-left-slider', 'value'),
-     State('crop-right-slider', 'value')],
-    prevent_initial_call=True
-)
-def save_merged(n_clicks, rotation, spacing, offset_x, offset_y, center_point, opacity, show_labels,
-                 fluor_data, show_fluor, c_top, c_bot, c_left, c_right):
-    current = _uploaded_image if _uploaded_image is not None else original_image
-    rotated = _get_rotated_pil(current, rotation)
-    w, h = rotated.size
-    cx = center_point.get('x', 0) if center_point else 0
-    cy = center_point.get('y', 0) if center_point else 0
-    bounds = _crop_bounds(w, h, c_top, c_bot, c_left, c_right)
-
-    # Draw grid on RGBA overlay
-    overlay = Image.new('RGBA', (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    alpha = int(opacity * 255)
-    color = (0, 255, 255, alpha)
-
-    col_positions, row_positions = _grid_positions(spacing, cx + offset_x, cy + offset_y, w, h, bounds=bounds)
-    for x in col_positions:
-        draw.line([(x, 0), (x, h)], fill=color, width=2)
-    for y in row_positions:
-        draw.line([(0, y), (w, y)], fill=color, width=2)
-
-    if show_labels and 'show' in show_labels:
-        font_size = min(max(int(spacing * 0.15), 8), 16)
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", font_size)
-        except Exception:
-            try:
-                font = ImageFont.truetype("Arial.ttf", font_size)
-            except Exception:
-                font = ImageFont.load_default()
-        for r in range(len(row_positions) - 1):
-            for c in range(len(col_positions) - 1):
-                cx = (col_positions[c] + col_positions[c + 1]) / 2
-                cy = (row_positions[r] + row_positions[r + 1]) / 2
-                label = _row_label(r) + str(c + 1)
-                draw.text((cx, cy), label, fill=color, font=font, anchor='mm')
-
-    # Draw fluorescence values if computed and checked
-    if show_fluor and 'show' in show_fluor and fluor_data and fluor_data.get('values'):
-        vals = fluor_data['values']
-        font_size = min(max(int(spacing * 0.14), 8), 14)
-        try:
-            f_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", font_size)
-        except Exception:
-            try:
-                f_font = ImageFont.truetype("Arial.ttf", font_size)
-            except Exception:
-                f_font = ImageFont.load_default()
-
-        yellow_color = (255, 255, 0, 230)
-        for r in range(min(len(vals), len(row_positions) - 1)):
-            for c in range(min(len(vals[r]), len(col_positions) - 1)):
-                cx = (col_positions[c] + col_positions[c + 1]) / 2
-                cy = (row_positions[r] + row_positions[r + 1]) / 2 + (spacing * 0.15 if show_labels and 'show' in show_labels else 0)
-                txt = f"{vals[r][c]:.1f}"
-                draw.text((cx, cy), txt, fill=yellow_color, font=f_font, anchor='mm')
-
-    # Composite
-    merged = rotated.convert('RGBA')
-    merged = Image.alpha_composite(merged, overlay)
-    merged = merged.convert('RGB')
-
-    buf = BytesIO()
-    merged.save(buf, format='PNG')
-    buf.seek(0)
-    return dcc.send_bytes(buf.getvalue(), 'microscopy_merged.png')
-
-
-# ── Save Fluorescence Matrix CSV ───────────────────────────────────────
-@app.callback(
-    Output('download-csv', 'data'),
-    Input('btn-save-csv', 'n_clicks'),
-    State('fluor-store', 'data'),
-    prevent_initial_call=True
-)
-def save_csv(n_clicks, fluor_data):
-    if not fluor_data or not fluor_data.get('values'):
-        raise dash.exceptions.PreventUpdate
-
-    values = fluor_data['values']
-    n_rows = fluor_data['n_rows']
-    n_cols = fluor_data['n_cols']
-    channel = fluor_data.get('channel', 'mean')
-
-    header = ['Row/Col'] + [str(c + 1) for c in range(n_cols)]
-    rows = [header]
-    for r in range(n_rows):
-        row_str = [_row_label(r)] + [f"{values[r][c]:.3f}" for c in range(n_cols)]
-        rows.append(row_str)
-
-    content = '\n'.join([','.join(row) for row in rows])
-    return dcc.send_string(content, f'fluorescence_matrix_{channel}.csv')
-
 
 # ── Save grid settings ────────────────────────────────────────────────
 # `crop_top/bottom/left/right` here are real, functional section bounds (not cosmetic) —
