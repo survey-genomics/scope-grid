@@ -27,15 +27,22 @@ app = dash.Dash(__name__, title="Microscopy Grid Aligner")
 #   `schema_version: 3`. Every save from this version of the app writes `schema_version: 3` and
 #   `source`. Files with schema_version < 3 (or no key at all) always imply `source == "jpg"`,
 #   since TIF-source alignment didn't exist yet when they were written.
+# 4: added the `tif_downsample` field. When `source == "tif"`, the grid may have been aligned
+#   against a DOWNSAMPLED preview of the TIF (the "Load TIF from local path" downsample option),
+#   not the TIF's true full-resolution pixel grid. `tif_downsample` records that factor (1 if
+#   the TIF wasn't downsampled, e.g. a browser upload) so consumers can rescale the pixel-valued
+#   grid settings (spacing/offsets/center point) back up to the TIF's real pixel space. Files
+#   with schema_version < 4 (or no `tif_downsample` key) are read as `tif_downsample == 1`.
 #
 # `CROP_SCHEMA_VERSION` (kept separate from `SETTINGS_SCHEMA_VERSION`, which just tracks the
 # CURRENT format this app writes) is the fixed threshold `load_settings` uses to stay backwards
 # compatible: legacy files (schema_version < CROP_SCHEMA_VERSION) have their stored crop values
 # ignored on load (reset to 0), so old alignments open exactly as they looked when they were
 # saved, instead of suddenly being clipped by cosmetic leftovers. Bumping
-# `SETTINGS_SCHEMA_VERSION` for the new `source` field must NOT change that threshold.
+# `SETTINGS_SCHEMA_VERSION` for the new `source`/`tif_downsample` fields must NOT change that
+# threshold.
 CROP_SCHEMA_VERSION = 2
-SETTINGS_SCHEMA_VERSION = 3
+SETTINGS_SCHEMA_VERSION = 4
 
 # ── Load sample image ──────────────────────────────────────────────────
 try:
@@ -61,6 +68,16 @@ _uploaded_image = None
 # control doesn't require re-uploading.
 _uploaded_tif_array = None
 _tif_decode_cache = {}
+# Downsample factor used to produce the CURRENTLY loaded `_uploaded_tif_array`, i.e. how many
+# full-resolution TIF pixels each pixel of that array represents. 1 for browser uploads (never
+# downsampled) and for anything that isn't a TIF; set to the chosen downsample step whenever a
+# TIF is loaded via the local-path loader. Recorded in saved settings JSONs (`tif_downsample`)
+# so grid alignments done against a downsampled array can be rescaled back to the TIF's true,
+# full-resolution pixel space later (by scoper.py, or by reloading settings into this app) --
+# without this, pixel-valued grid settings (spacing/offsets/center point) recorded against a
+# downsampled preview would be silently misapplied at a different (denser) scale wherever the
+# full-resolution TIF is used instead.
+_uploaded_tif_downsample = 1
 # Cache for TIFs loaded from a local path (keyed by path + mtime + downsample factor), bounded
 # to the most recent one. This exists so `update_image` and `reset_vmin_vmax_for_channel` --
 # two INDEPENDENT callbacks both triggered by the same `btn-load-tif-path.n_clicks` click, with
@@ -532,7 +549,7 @@ app.layout = html.Div([
 )
 def update_image(upload_contents, load_tif_clicks, rotation, channel, vmin_vmax,
                   upload_filename, tif_path, downsample_factor):
-    global _uploaded_image, _uploaded_tif_array
+    global _uploaded_image, _uploaded_tif_array, _uploaded_tif_downsample
 
     ctx = dash.callback_context
     trigger_id = ctx.triggered[0]['prop_id'] if ctx.triggered else '.'
@@ -549,6 +566,7 @@ def update_image(upload_contents, load_tif_clicks, rotation, channel, vmin_vmax,
                 is_tif = bool(upload_filename) and upload_filename.lower().endswith(('.tif', '.tiff'))
                 if is_tif:
                     _uploaded_tif_array = _decode_tif_from_b64(content_string)
+                    _uploaded_tif_downsample = 1
                     _uploaded_image = None
                 else:
                     decoded = base64.b64decode(content_string)
@@ -577,6 +595,7 @@ def update_image(upload_contents, load_tif_clicks, rotation, channel, vmin_vmax,
                 step = max(int(downsample_factor or 1), 1)
                 array = _load_tif_path_cached(tif_path, step)
                 _uploaded_tif_array = array
+                _uploaded_tif_downsample = step
                 _uploaded_image = None
                 _tif_rotated_cache.clear()
                 print(f"[update_image] loaded TIF from path {tif_path!r}: shape={array.shape} "
@@ -1004,6 +1023,7 @@ def save_settings(n_clicks, rotation, spacing_x, spacing_y, link_spacing, offset
     settings = {
         'schema_version': SETTINGS_SCHEMA_VERSION,
         'source': 'tif' if _uploaded_tif_array is not None else 'jpg',
+        'tif_downsample': _uploaded_tif_downsample if _uploaded_tif_array is not None else 1,
         'rotation': rotation,
         'grid_spacing': spacing_x,
         'grid_y_spacing': spacing_y,
